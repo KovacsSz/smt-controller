@@ -1,154 +1,103 @@
 /**
- * Operation Tab controller
+ * Operation Tab controller — visualization only
  */
 
 'use strict';
 
 const OperationTab = (() => {
-  let totalPcbs = 0;
-  let pcbsCompleted = 0;
+  let totalPcbs        = 0;
+  let pcbsCompleted    = 0;
   let productionActive = false;
-  let startTime = null;
-  let statsTimer = null;
-
-  // ── DOM ───────────────────────────────────────────────────────────────────
-  const totalInput    = () => document.getElementById('totalPcbsInput');
-  const stopBtn       = () => document.getElementById('stopProductionBtn');
-  const progressLabel = () => document.getElementById('progressLabel');
-  const progressBar   = () => document.getElementById('productionProgress');
-  const tableBody     = () => document.querySelector('#stationStatusTable tbody');
-
-  // ── Wire buttons ──────────────────────────────────────────────────────────
-  document.addEventListener('DOMContentLoaded', () => {
-    stopBtn().addEventListener('click', stopProduction);
-  });
-
-  // ── Called when all components are distributed ────────────────────────────
-  function onSetupComplete() {
-    buildStatusTable();
-  }
+  let startTime        = null;
+  let statsTimer       = null;
 
   function buildStatusTable() {
-    const tbody = tableBody();
+    const tbody = document.querySelector('#stationStatusTable tbody');
+    if (!tbody) return;
     tbody.innerHTML = '';
     const stations = [AppState.loaderStationId, ...AppState.pnpStations];
-    stations.forEach((sid) => {
+    stations.forEach(sid => {
       const name = sid === AppState.loaderStationId ? 'Loader' : `P&P ${sid}`;
       const tr = document.createElement('tr');
       tr.id = `op-row-${sid}`;
       tr.innerHTML = `
         <td>${name}</td>
-        <td id="op-status-${sid}">-</td>
-        <td id="op-pcb-${sid}">-</td>
-        <td id="op-comp-${sid}">-</td>
-        <td id="op-cycle-${sid}">-</td>
-        <td id="op-avg-${sid}">-</td>
+        <td id="op-status-${sid}">—</td>
+        <td id="op-pcb-${sid}">—</td>
+        <td id="op-cycle-${sid}">—</td>
+        <td id="op-avg-${sid}">—</td>
       `;
       tbody.appendChild(tr);
     });
   }
 
-  // ── Server events ─────────────────────────────────────────────────────────
   function onProductionStarted({ totalPcbs: t }) {
     totalPcbs = t;
     pcbsCompleted = 0;
     productionActive = true;
     startTime = Date.now();
-    totalInput().disabled = true;
-    stopBtn().disabled = false;
-    progressLabel().textContent = `0 / ${totalPcbs} PCBs completed`;
-    progressBar().value = 0;
     startStatsTimer();
   }
 
-  function onProductionStopped() {
-    _deactivate();
-  }
+  function onProductionStopped() { _deactivate(); }
 
   function onProductionComplete({ totalPcbs: t, totalTime, throughputPerMin }) {
     _deactivate();
-    alert(
-      `All ${t} PCBs completed!\n` +
-      `Total time: ${totalTime.toFixed(1)} s\n` +
-      `Throughput: ${throughputPerMin.toFixed(2)} PCB/min`
-    );
+    const fill = document.getElementById('progressFill');
+    if (fill) { fill.style.width = '100%'; fill.classList.add('complete'); }
+    logEvent(`✓ Complete: ${t} PCBs | ${totalTime.toFixed(1)}s | ${throughputPerMin.toFixed(2)} PCB/min`);
   }
 
   function onPcbCompleted({ pcbsCompleted: c, totalPcbs: t }) {
     pcbsCompleted = c;
-    updateProgress(c, t);
   }
 
-  function onStateChange({ slaveId, statusName, oldStatus, newStatus }) {
-    const el = document.getElementById(`op-status-${slaveId}`);
-    if (el) el.textContent = statusName;
+  function onStateChange({ slaveId, statusName }) {
+    setText(`op-status-${slaveId}`, statusName);
   }
 
-  function onSnapshot(snapshot) {
-    if (!snapshot) return;
-    snapshot.stationRows?.forEach((row) => {
+  function onSnapshot(snap) {
+    if (!snap) return;
+    snap.stationRows?.forEach(row => {
       const sid = row.slaveId;
-      setText(`op-status-${sid}`, row.statusName ?? '-');
-      setText(`op-pcb-${sid}`,    row.pcbId > 0 ? row.pcbId : '-');
-      setText(`op-cycle-${sid}`,  row.cycleTime != null ? row.cycleTime.toFixed(1) : '-');
-      setText(`op-avg-${sid}`,    row.avgCycleTime != null ? row.avgCycleTime.toFixed(1) : '-');
+      setText(`op-status-${sid}`, row.statusName ?? '—');
+      setText(`op-pcb-${sid}`,    row.pcbId > 0 ? row.pcbId : '—');
+      setText(`op-cycle-${sid}`,  row.cycleTime    != null ? row.cycleTime.toFixed(1)    : '—');
+      setText(`op-avg-${sid}`,    row.avgCycleTime != null ? row.avgCycleTime.toFixed(1) : '—');
     });
-
-    if (snapshot.productionActive) {
-      pcbsCompleted = snapshot.pcbsCompleted;
-      updateProgress(snapshot.pcbsCompleted, snapshot.totalPcbs);
+    if (snap.productionActive) {
+      pcbsCompleted = snap.pcbsCompleted;
+      setText('stat-completed', snap.pcbsCompleted);
+      setText('stat-remaining', snap.totalPcbs - snap.pcbsCompleted);
     }
   }
 
-  // ── Stop production ───────────────────────────────────────────────────────
-  async function stopProduction() {
-    if (!confirm('Are you sure you want to stop production?')) return;
-    await apiPost('/api/operation/stop', {});
-  }
-
-  // ── Stats timer ───────────────────────────────────────────────────────────
   function startStatsTimer() {
     if (statsTimer) clearInterval(statsTimer);
     statsTimer = setInterval(() => {
       if (!productionActive) { clearInterval(statsTimer); return; }
       const elapsed = (Date.now() - startTime) / 1000;
-      setText('stat-completed',  String(pcbsCompleted));
-      setText('stat-remaining',  String(totalPcbs - pcbsCompleted));
       const h = Math.floor(elapsed / 3600);
       const m = Math.floor((elapsed % 3600) / 60);
       const s = Math.floor(elapsed % 60);
-      setText('stat-totalTime',
-        `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`);
+      setText('stat-totalTime',  `${pad(h)}:${pad(m)}:${pad(s)}`);
+      setText('stat-completed',  pcbsCompleted);
+      setText('stat-remaining',  totalPcbs - pcbsCompleted);
       const thr = elapsed > 0 ? (pcbsCompleted / elapsed) * 60 : 0;
       setText('stat-throughput', `${thr.toFixed(2)} PCB/min`);
     }, 1000);
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
   function _deactivate() {
     productionActive = false;
-    totalInput().disabled = false;
-    stopBtn().disabled = true;
     if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   }
 
-  function updateProgress(completed, total) {
-    progressBar().value = total > 0 ? Math.round((completed / total) * 100) : 0;
-    progressLabel().textContent = `${completed} / ${total} PCBs completed`;
-  }
-
-  function setText(id, text) {
+  function setText(id, val) {
     const el = document.getElementById(id);
-    if (el) el.textContent = text;
+    if (el) el.textContent = val;
   }
+  function pad(n) { return String(n).padStart(2, '0'); }
 
-  return {
-    onSetupComplete,
-    onProductionStarted,
-    onProductionStopped,
-    onProductionComplete,
-    onPcbCompleted,
-    onStateChange,
-    onSnapshot,
-  };
+  return { buildStatusTable, onProductionStarted, onProductionStopped, onProductionComplete, onPcbCompleted, onStateChange, onSnapshot };
 })();

@@ -1,6 +1,7 @@
 /**
  * SMT Pick and Place Machine Controller
  * Express + Socket.IO backend server
+ * Auto-connects when PCB Loader (Slave ID 5) is detected
  */
 
 'use strict';
@@ -35,106 +36,164 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── APPLICATION STATE ────────────────────────────────────────────────────────
 
-let modbusHandler     = null;
-let stationManager    = null;
-let availableStations = [];
-let loaderStationId   = PCB_LOADER_SLAVE_ID;
-let pnpStations       = [];
-let pendingTotalPcbs  = 10;
+let modbusHandler       = null;
+let stationManager      = null;
+let availableStations   = [];
+let loaderStationId     = PCB_LOADER_SLAVE_ID;
+let pnpStations         = [];
+let pendingTotalPcbs    = 10;
+
+// Auto-detection state
+let autoDetectTimer     = null;
+let autoDetectRunning   = false;
+let systemState         = 'idle'; // idle | detecting | initializing | setup | production | error
+
+const RESET_POLL_INTERVAL_MS  = 500;
+const RESET_TOTAL_TIMEOUT_MS  = 30000;
+const UI_WAIT_PER_STATION_MS  = 20000;
+const UI_POLL_INTERVAL_MS     = 500;
+const AUTO_DETECT_INTERVAL_MS = 3000;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ─── SOCKET.IO ────────────────────────────────────────────────────────────────
+// ─── BROADCAST HELPERS ────────────────────────────────────────────────────────
 
-io.on('connection', (socket) => {
-  console.log('[Socket] Client connected:', socket.id);
-
-  // Send current state immediately on join
-  socket.emit('connectionState', {
-    connected:         modbusHandler?.connected ?? false,
-    availableStations,
-    loaderStationId,
-    pnpStations,
-  });
-
-  if (stationManager) {
-    socket.emit('snapshot', stationManager.getSnapshot());
-  }
-
-  socket.on('disconnect', () => {
-    console.log('[Socket] Client disconnected:', socket.id);
-  });
-});
-
-/** Broadcast to all connected clients */
 function broadcast(event, data) {
   io.emit(event, data);
 }
 
-/**
- * Manager emit callback — routes StationManager events to clients.
- * Also handles the physical-button → auto-start flow.
- */
+function setSystemState(state, extra = {}) {
+  systemState = state;
+  broadcast('systemState', { state, ...extra });
+  console.log(`[System] State → ${state}`, extra);
+}
+
+function logInit(message, pct = null) {
+  const payload = { message };
+  if (pct !== null) payload.pct = pct;
+  broadcast('initProgress', payload);
+  console.log(`[Init] ${message}`);
+}
+
+// ─── MANAGER EMIT ─────────────────────────────────────────────────────────────
+
 function managerEmit(event) {
-  // Forward every event to the browser under its type name
   io.emit(event.type, event);
 
-  // Physical button pressed → wait 1 s then start production
   if (event.type === 'buttonPressed' && stationManager) {
+    console.log('[Server] Physical button pressed – auto-starting production in 1s');
     setTimeout(async () => {
       try {
         for (const sid of availableStations) {
           await modbusHandler.setActivePage(sid, PageID.PICK_AND_PLACE_ANIMATION);
         }
         await stationManager.startProduction(pendingTotalPcbs);
+        setSystemState('production');
       } catch (err) {
         console.error('[Server] Failed to auto-start production:', err.message);
+        setSystemState('error', { message: err.message });
       }
     }, 1000);
   }
+
+  if (event.type === 'productionComplete' || event.type === 'returnedToSetup') {
+    setSystemState('setup');
+  }
+
+  if (event.type === 'productionStopped') {
+    setSystemState('setup');
+  }
+
+  if (event.type === 'setupComplete') {
+    setSystemState('setup', { waitingForButton: true });
+  }
 }
 
-// ─── REST API ─────────────────────────────────────────────────────────────────
+// ─── AUTO-DETECT & INITIALIZE ────────────────────────────────────────────────
 
-// ── List serial ports ─────────────────────────────────────────────────────────
-app.get('/api/ports', async (_req, res) => {
+async function tryDetectAndInitialize() {
+  if (autoDetectRunning) return;
+  if (modbusHandler && modbusHandler.connected) return;
+
+  autoDetectRunning = true;
+
   try {
+    // Get all available serial ports
     const ports = await SerialPort.list();
-    res.json(ports);
+    if (ports.length === 0) {
+      autoDetectRunning = false;
+      return;
+    }
+
+    setSystemState('detecting');
+    logInit('Auto-detecting PCB Loader on available ports...');
+
+    let detectedPort  = null;
+    let tempHandler   = null;
+
+    // Try each port
+    for (const portInfo of ports) {
+      const portPath = portInfo.path;
+      logInit(`  Trying ${portPath}...`);
+
+      const handler = new ModbusHandler(portPath, {
+        timeoutMs:    500,
+        retries:      1,
+        retryDelayMs: 100,
+      });
+
+      try {
+        const opened = await handler.connect();
+        if (!opened) {
+          handler.disconnect();
+          continue;
+        }
+
+        const found = await handler.pingStation(PCB_LOADER_SLAVE_ID);
+        if (found) {
+          detectedPort = portPath;
+          tempHandler  = handler;
+          logInit(`  ✓ PCB Loader found on ${portPath}`);
+          break;
+        } else {
+          handler.disconnect();
+        }
+      } catch {
+        try { handler.disconnect(); } catch { /* ignore */ }
+      }
+
+      await sleep(100);
+    }
+
+    if (!detectedPort || !tempHandler) {
+      setSystemState('idle');
+      autoDetectRunning = false;
+      return;
+    }
+
+    // PCB Loader detected — run full initialization
+    await runInitialization(detectedPort, tempHandler);
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Connect & Initialise ──────────────────────────────────────────────────────
-app.post('/api/connect', async (req, res) => {
-  const { port } = req.body;
-  if (!port) return res.status(400).json({ error: 'port is required' });
-
-  // Tunable timeouts
-  const RESET_POLL_INTERVAL_MS  = 500;    // how often to poll "reset complete?"
-  const RESET_TOTAL_TIMEOUT_MS  = 30000;  // max wait for reset to finish
-  const UI_WAIT_PER_STATION_MS  = 20000;  // max wait for UI to load after reset
-  const UI_POLL_INTERVAL_MS     = 500;    // how often to poll IS_UI_LOADED
-
-  function log(message, pct = null) {
-    const payload = { message };
-    if (pct !== null) payload.pct = pct;
-    broadcast('initProgress', payload);
-    console.log(`[Init] ${message}`);
-  }
-
-  try {
-    // Disconnect any existing session
+    console.error('[AutoDetect] Error:', err.message);
+    setSystemState('error', { message: err.message });
     if (modbusHandler) {
       modbusHandler.disconnect();
       modbusHandler = null;
     }
+    autoDetectRunning = false;
+  }
+}
 
-    // ── PHASE 0: Open serial port ─────────────────────────────────────────────
-    log(`Connecting to ${port}...`, 0);
+async function runInitialization(port, existingHandler) {
+  setSystemState('initializing');
+
+  try {
+    // Reuse the handler that already found the loader, but recreate with proper timeouts
+    existingHandler.disconnect();
+    await sleep(200);
 
     modbusHandler = new ModbusHandler(port, {
       timeoutMs:    1000,
@@ -145,39 +204,33 @@ app.post('/api/connect', async (req, res) => {
     if (!(await modbusHandler.connect())) {
       throw new Error(`Failed to open serial port ${port}`);
     }
-    log('✓ Serial port opened', 2);
 
-    // Short settling delay after opening the port
+    logInit(`✓ Serial port ${port} opened`, 2);
     await sleep(200);
 
-    // ── Detect PCB Loader (required) ──────────────────────────────────────────
-    log(`Detecting PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})...`, 5);
-
+    // ── Verify PCB Loader ────────────────────────────────────────────────────
+    logInit(`Verifying PCB Loader (Slave ID ${PCB_LOADER_SLAVE_ID})...`, 5);
     let loaderFound = false;
     for (let attempt = 0; attempt < 5; attempt++) {
       loaderFound = await modbusHandler.pingStation(PCB_LOADER_SLAVE_ID);
       if (loaderFound) break;
-      log(`  PCB Loader not responding, retry ${attempt + 1}/5...`);
       await sleep(500);
     }
     if (!loaderFound) {
-      throw new Error(
-        `PCB Loader Station (ID ${PCB_LOADER_SLAVE_ID}) not found — ` +
-        `is it powered and connected to ${port}?`
-      );
+      throw new Error(`PCB Loader (ID ${PCB_LOADER_SLAVE_ID}) not responding`);
     }
-    log(`✓ PCB Loader detected (ID ${PCB_LOADER_SLAVE_ID})`, 10);
+    logInit(`✓ PCB Loader confirmed (ID ${PCB_LOADER_SLAVE_ID})`, 10);
 
-    // ── Detect P&P stations ───────────────────────────────────────────────────
-    log('Detecting Pick and Place stations...', 12);
+    // ── Detect P&P stations ──────────────────────────────────────────────────
+    logInit('Detecting Pick and Place stations...', 12);
     const foundPnp = [];
     for (const sid of SLAVE_IDS) {
       const found = await modbusHandler.pingStation(sid);
       if (found) {
         foundPnp.push(sid);
-        log(`  ✓ P&P Station ${sid} detected`);
+        logInit(`  ✓ P&P Station ${sid} detected`);
       } else {
-        log(`  – P&P Station ${sid} not found (skipped)`);
+        logInit(`  – P&P Station ${sid} not found`);
       }
       await sleep(100);
     }
@@ -185,25 +238,23 @@ app.post('/api/connect', async (req, res) => {
     if (foundPnp.length === 0) {
       throw new Error('No Pick and Place stations detected');
     }
-    log(`✓ ${foundPnp.length} P&P station(s) found: [${foundPnp}]`, 18);
+    logInit(`✓ ${foundPnp.length} P&P station(s) found: [${foundPnp}]`, 18);
 
     const allStations = [PCB_LOADER_SLAVE_ID, ...foundPnp];
 
-    // ── PHASE 1: Send soft reset to ALL stations ──────────────────────────────
-    log('\nPhase 1 — Sending soft reset to all stations...', 20);
+    // ── Soft reset ALL stations ──────────────────────────────────────────────
+    logInit('\nPhase 1 — Resetting all stations...', 20);
 
     for (const sid of allStations) {
-      const name = sid === PCB_LOADER_SLAVE_ID
-        ? 'PCB Loader'
-        : `Pick & Place ${sid}`;
-      const ok = await modbusHandler.softReset(sid);
-      if (!ok) throw new Error(`Failed to send soft reset to ${name}`);
-      log(`  ↺ Reset sent → ${name}`);
+      const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `P&P ${sid}`;
+      const ok   = await modbusHandler.softReset(sid);
+      if (!ok) throw new Error(`Failed to reset ${name}`);
+      logInit(`  ↺ Reset sent → ${name}`);
       await sleep(50);
     }
 
-    // ── PHASE 2: Wait for ALL stations to complete reset ──────────────────────
-    log('\nPhase 2 — Waiting for all stations to complete reset...');
+    // ── Wait for reset complete ───────────────────────────────────────────────
+    logInit('\nPhase 2 — Waiting for stations to complete reset...');
 
     const pending    = new Set(allStations);
     const confirmed  = new Set();
@@ -211,112 +262,67 @@ app.post('/api/connect', async (req, res) => {
 
     while (pending.size > 0) {
       if (Date.now() - resetStart > RESET_TOTAL_TIMEOUT_MS) {
-        const names = [...pending].map((s) =>
-          s === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `Pick & Place ${s}`
-        );
-        throw new Error(
-          `Reset timeout (${RESET_TOTAL_TIMEOUT_MS / 1000}s) for: ${names.join(', ')}`
-        );
+        throw new Error(`Reset timeout for stations: [${[...pending]}]`);
       }
-
       for (const sid of [...pending]) {
         const done = await modbusHandler.checkSoftResetComplete(sid);
         if (done) {
-          const name = sid === PCB_LOADER_SLAVE_ID
-            ? 'PCB Loader'
-            : `Pick & Place ${sid}`;
-          log(`  ✓ ${name}: reset complete`);
+          const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `P&P ${sid}`;
+          logInit(`  ✓ ${name}: reset complete`);
           pending.delete(sid);
           confirmed.add(sid);
           const pct = 20 + Math.round((confirmed.size / allStations.length) * 30);
           broadcast('initProgress', { pct });
         }
       }
-
       if (pending.size > 0) await sleep(RESET_POLL_INTERVAL_MS);
     }
 
-    // ── PHASE 3: Wait for UI to load on every station ─────────────────────────
-    //
-    // After reset the embedded UI takes time to boot.
-    // Poll IS_UI_LOADED until true (or timeout).
-    //
-    log('\nPhase 3 — Waiting for UIs to load on all stations...');
+    // ── Wait for UIs to load ──────────────────────────────────────────────────
+    logInit('\nPhase 3 — Waiting for station UIs to load...');
     broadcast('initProgress', { pct: 55 });
 
     for (let i = 0; i < allStations.length; i++) {
       const sid  = allStations[i];
-      const name = sid === PCB_LOADER_SLAVE_ID
-        ? 'PCB Loader'
-        : `Pick & Place ${sid}`;
+      const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `P&P ${sid}`;
+      logInit(`  ⏳ Waiting for ${name} UI...`);
 
-      log(`  ⏳ Waiting for ${name} UI...`);
-
-      const uiLoaded = await modbusHandler.checkUiLoaded(
-        sid,
-        UI_WAIT_PER_STATION_MS,
-        UI_POLL_INTERVAL_MS
+      const loaded = await modbusHandler.checkUiLoaded(
+        sid, UI_WAIT_PER_STATION_MS, UI_POLL_INTERVAL_MS
       );
-
-      if (!uiLoaded) {
-        throw new Error(
-          `${name} UI did not load within ${UI_WAIT_PER_STATION_MS / 1000}s. ` +
-          'Check the station display.'
-        );
+      if (!loaded) {
+        throw new Error(`${name} UI did not load within ${UI_WAIT_PER_STATION_MS / 1000}s`);
       }
-
-      log(`  ✓ ${name}: UI loaded`);
-      const pct = 55 + Math.round(((i + 1) / allStations.length) * 20);
-      broadcast('initProgress', { pct });
+      logInit(`  ✓ ${name}: UI loaded`);
+      broadcast('initProgress', { pct: 55 + Math.round(((i + 1) / allStations.length) * 20) });
     }
 
-    // ── PHASE 4: Verify station IDs and set setup page ────────────────────────
-    log('\nPhase 4 — Verifying station IDs and setting setup page...');
+    // ── Verify IDs & set setup page ───────────────────────────────────────────
+    logInit('\nPhase 4 — Verifying station IDs and setting setup page...');
     broadcast('initProgress', { pct: 78 });
 
     for (let i = 0; i < allStations.length; i++) {
       const sid  = allStations[i];
-      const name = sid === PCB_LOADER_SLAVE_ID
-        ? 'PCB Loader'
-        : `Pick & Place ${sid}`;
+      const name = sid === PCB_LOADER_SLAVE_ID ? 'PCB Loader' : `P&P ${sid}`;
 
       const stationId = await modbusHandler.getStationId(sid);
-      if (stationId === null) {
-        throw new Error(`${name}: could not read station ID register`);
-      }
-      if (stationId !== sid) {
-        throw new Error(
-          `${name} ID mismatch: expected ${sid}, got ${stationId}. ` +
-          'Check station configuration.'
-        );
-      }
+      if (stationId === null) throw new Error(`${name}: cannot read station ID`);
+      if (stationId !== sid)  throw new Error(`${name} ID mismatch: expected ${sid}, got ${stationId}`);
 
-      const pageOk = await modbusHandler.setActivePage(
-        sid, PageID.PLACEMENT_PARAMETERS_SETUP
-      );
-      if (!pageOk) {
-        throw new Error(`Failed to set setup page for ${name}`);
-      }
+      const ok = await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
+      if (!ok) throw new Error(`Failed to set setup page for ${name}`);
 
-      log(`  ✓ ${name}: ID ${stationId} verified, setup page set`);
-      const pct = 78 + Math.round(((i + 1) / allStations.length) * 20);
-      broadcast('initProgress', { pct });
+      logInit(`  ✓ ${name}: verified, setup page set`);
+      broadcast('initProgress', { pct: 78 + Math.round(((i + 1) / allStations.length) * 20) });
     }
 
     // ── Done ──────────────────────────────────────────────────────────────────
-    broadcast('initProgress', {
-      pct: 100,
-      message: '✓ ALL STATIONS INITIALIZED SUCCESSFULLY',
-    });
-    log(`  - PCB Loader  : Slave ID ${PCB_LOADER_SLAVE_ID}`);
-    log(`  - Pick & Place: Slave IDs [${foundPnp}]`);
+    broadcast('initProgress', { pct: 100, message: '✓ ALL STATIONS INITIALIZED' });
 
-    // Save application state
     availableStations = allStations;
     loaderStationId   = PCB_LOADER_SLAVE_ID;
     pnpStations       = foundPnp;
 
-    // Create station manager
     stationManager = new StationManager(
       modbusHandler,
       loaderStationId,
@@ -329,18 +335,19 @@ app.post('/api/connect', async (req, res) => {
       availableStations,
       loaderStationId,
       pnpStations,
+      port,
     });
 
-    return res.json({
-      success: true,
-      availableStations,
-      loaderStationId,
-      pnpStations,
-    });
+    // Immediately begin setup monitoring
+    await stationManager.onSetupComplete();
+    setSystemState('setup', { waitingForButton: false });
+
+    autoDetectRunning = false;
 
   } catch (err) {
-    console.error('[Server] Connect error:', err.message);
-    broadcast('initProgress', { message: `✗ ERROR: ${err.message}` });
+    console.error('[Init] Error:', err.message);
+    logInit(`✗ ERROR: ${err.message}`);
+    setSystemState('error', { message: err.message });
 
     if (modbusHandler) {
       modbusHandler.disconnect();
@@ -349,11 +356,66 @@ app.post('/api/connect', async (req, res) => {
     availableStations = [];
     pnpStations       = [];
 
-    return res.status(500).json({ error: err.message });
+    broadcast('connectionState', {
+      connected:         false,
+      availableStations: [],
+      pnpStations:       [],
+    });
+
+    autoDetectRunning = false;
+  }
+}
+
+// ─── START AUTO-DETECT LOOP ───────────────────────────────────────────────────
+
+function startAutoDetect() {
+  if (autoDetectTimer) clearInterval(autoDetectTimer);
+  autoDetectTimer = setInterval(() => {
+    if (!modbusHandler || !modbusHandler.connected) {
+      tryDetectAndInitialize();
+    }
+  }, AUTO_DETECT_INTERVAL_MS);
+
+  // Run immediately on start
+  tryDetectAndInitialize();
+}
+
+// ─── SOCKET.IO ────────────────────────────────────────────────────────────────
+
+io.on('connection', (socket) => {
+  console.log('[Socket] Client connected:', socket.id);
+
+  socket.emit('connectionState', {
+    connected:         modbusHandler?.connected ?? false,
+    availableStations,
+    loaderStationId,
+    pnpStations,
+  });
+
+  socket.emit('systemState', { state: systemState });
+
+  if (stationManager) {
+    socket.emit('snapshot', stationManager.getSnapshot());
+  }
+
+  socket.on('disconnect', () => {
+    console.log('[Socket] Client disconnected:', socket.id);
+  });
+});
+
+// ─── REST API ─────────────────────────────────────────────────────────────────
+
+// List serial ports
+app.get('/api/ports', async (_req, res) => {
+  try {
+    const ports = await SerialPort.list();
+    res.json(ports);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── Disconnect ────────────────────────────────────────────────────────────────
+// Manual disconnect (for admin use)
 app.post('/api/disconnect', (_req, res) => {
   if (stationManager) {
     stationManager._stopPolling();
@@ -365,17 +427,16 @@ app.post('/api/disconnect', (_req, res) => {
   }
   availableStations = [];
   pnpStations       = [];
+  setSystemState('idle');
 
   broadcast('connectionState', {
-    connected:         false,
-    availableStations: [],
-    pnpStations:       [],
+    connected: false, availableStations: [], pnpStations: [],
   });
 
   res.json({ success: true });
 });
 
-// ── Setup: read component distribution from stations ──────────────────────────
+// Setup: read component distribution
 app.get('/api/setup/components', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -383,12 +444,7 @@ app.get('/api/setup/components', async (_req, res) => {
     for (const sid of pnpStations) {
       const components = await modbusHandler.getComponentsToPlace(sid);
       result[sid] = components
-        ? {
-            transistors: components[0],
-            diodes:      components[1],
-            ics:         components[2],
-            capacitors:  components[3],
-          }
+        ? { transistors: components[0], diodes: components[1], ics: components[2], capacitors: components[3] }
         : { transistors: 0, diodes: 0, ics: 0, capacitors: 0 };
     }
     res.json(result);
@@ -397,63 +453,52 @@ app.get('/api/setup/components', async (_req, res) => {
   }
 });
 
-// ── Setup: write total positions to a station ─────────────────────────────────
+// Setup: write total positions
 app.post('/api/setup/total-positions', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { slaveId, transistors, diodes, ics, capacitors } = req.body;
   try {
-    const ok = await modbusHandler.setTotalPositions(
-      slaveId, transistors, diodes, ics, capacitors
-    );
+    const ok = await modbusHandler.setTotalPositions(slaveId, transistors, diodes, ics, capacitors);
     res.json({ success: ok });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Setup: activate / deactivate physical start button ────────────────────────
+// Setup: activate/deactivate physical start button
 app.post('/api/setup/start-button', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { active } = req.body;
   try {
     const ok = await modbusHandler.setStartButtonActive(loaderStationId, active);
-
     if (stationManager) {
       if (active) {
-        // Only call onSetupComplete the first time (it is idempotent internally,
-        // but we avoid even the extra async work on every poll tick)
         await stationManager.onSetupComplete();
+        setSystemState('setup', { waitingForButton: true });
       } else {
-        // Distribution changed — stop monitoring
         stationManager.onSetupIncomplete();
+        setSystemState('setup', { waitingForButton: false });
       }
     }
-
     res.json({ success: ok });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Operation: start production ───────────────────────────────────────────────
-app.post('/api/operation/start', async (req, res) => {
-  if (!modbusHandler || !stationManager) {
-    return res.status(400).json({ error: 'Not connected' });
-  }
+// Operation: set total PCBs
+app.post('/api/operation/set-total', (req, res) => {
   const { totalPcbs } = req.body;
-  pendingTotalPcbs = totalPcbs ?? 10;
-  try {
-    for (const sid of availableStations) {
-      await modbusHandler.setActivePage(sid, PageID.PICK_AND_PLACE_ANIMATION);
-    }
-    await stationManager.startProduction(pendingTotalPcbs);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (totalPcbs && totalPcbs > 0) {
+    pendingTotalPcbs = parseInt(totalPcbs);
+    broadcast('totalPcbsUpdated', { totalPcbs: pendingTotalPcbs });
+    res.json({ success: true, totalPcbs: pendingTotalPcbs });
+  } else {
+    res.status(400).json({ error: 'Invalid totalPcbs' });
   }
 });
 
-// ── Operation: stop production ────────────────────────────────────────────────
+// Operation: stop production
 app.post('/api/operation/stop', async (_req, res) => {
   if (!stationManager) return res.status(400).json({ error: 'Not connected' });
   try {
@@ -464,114 +509,50 @@ app.post('/api/operation/stop', async (_req, res) => {
   }
 });
 
-// ── Operation: get snapshot ───────────────────────────────────────────────────
+// Operation: snapshot
 app.get('/api/operation/snapshot', (_req, res) => {
   if (!stationManager) return res.status(400).json({ error: 'Not connected' });
   res.json(stationManager.getSnapshot());
 });
 
-// ── Configuration: read from first P&P station ───────────────────────────────
+// Configuration: read
 app.get('/api/configuration', async (_req, res) => {
   if (!modbusHandler || pnpStations.length === 0) {
     return res.status(400).json({ error: 'No P&P stations connected' });
   }
   const slaveId = pnpStations[0];
   try {
-    const timing = await modbusHandler.readHoldingRegisters(
-      slaveId,
-      HoldingRegisterAddresses.TRANSISTOR_PLACEMENT_DURATION_MS,
-      5
-    );
-    const led = await modbusHandler.readHoldingRegisters(
-      slaveId,
-      HoldingRegisterAddresses.BRIGHTNESS_RED_LED,
-      6
-    );
-    const rfid = await modbusHandler.readHoldingRegisters(
-      slaveId,
-      HoldingRegisterAddresses.RFID_BOX_UID_START,
-      12
-    );
-    const vol = await modbusHandler.readHoldingRegisters(
-      slaveId,
-      HoldingRegisterAddresses.SPEAKER_VOLUME,
-      1
-    );
+    const timing = await modbusHandler.readHoldingRegisters(slaveId, HoldingRegisterAddresses.TRANSISTOR_PLACEMENT_DURATION_MS, 5);
+    const led    = await modbusHandler.readHoldingRegisters(slaveId, HoldingRegisterAddresses.BRIGHTNESS_RED_LED, 6);
+    const rfid   = await modbusHandler.readHoldingRegisters(slaveId, HoldingRegisterAddresses.RFID_BOX_UID_START, 12);
+    const vol    = await modbusHandler.readHoldingRegisters(slaveId, HoldingRegisterAddresses.SPEAKER_VOLUME, 1);
 
     res.json({
-      timing: timing
-        ? {
-            transistor: timing[0],
-            diode:      timing[1],
-            ic:         timing[2],
-            capacitor:  timing[3],
-            transport:  timing[4],
-          }
-        : null,
-      led: led
-        ? {
-            red:             led[0],
-            yellow:          led[1],
-            green:           led[2],
-            rgb:             led[3],
-            thresholdYellow: led[4],
-            thresholdRed:    led[5],
-          }
-        : null,
-      rfid: rfid
-        ? Array.from({ length: 4 }, (_, i) => ({
-            uidHigh: rfid[i * 2],
-            uidLow:  rfid[i * 2 + 1],
-            count:   rfid[8 + i],
-          }))
-        : null,
-      volume: vol ? vol[0] : null,
+      timing: timing ? { transistor: timing[0], diode: timing[1], ic: timing[2], capacitor: timing[3], transport: timing[4] } : null,
+      led:    led    ? { red: led[0], yellow: led[1], green: led[2], rgb: led[3], thresholdYellow: led[4], thresholdRed: led[5] } : null,
+      rfid:   rfid   ? Array.from({ length: 4 }, (_, i) => ({ uidHigh: rfid[i * 2], uidLow: rfid[i * 2 + 1], count: rfid[8 + i] })) : null,
+      volume: vol    ? vol[0] : null,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Configuration: write to all stations ──────────────────────────────────────
+// Configuration: write
 app.post('/api/configuration', async (req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   const { timing, led, rfid, volume } = req.body;
   try {
     for (const sid of availableStations) {
-      if (timing) {
-        await modbusHandler.setTimingConfig(
-          sid,
-          timing.transistor,
-          timing.diode,
-          timing.ic,
-          timing.capacitor,
-          timing.transport
-        );
-      }
-      if (led) {
-        await modbusHandler.setLedConfig(
-          sid,
-          led.red,
-          led.yellow,
-          led.green,
-          led.rgb,
-          led.thresholdYellow,
-          led.thresholdRed
-        );
-      }
+      if (timing) await modbusHandler.setTimingConfig(sid, timing.transistor, timing.diode, timing.ic, timing.capacitor, timing.transport);
+      if (led)    await modbusHandler.setLedConfig(sid, led.red, led.yellow, led.green, led.rgb, led.thresholdYellow, led.thresholdRed);
       if (rfid) {
-        const rfidValues = [];
-        for (const box of rfid) rfidValues.push(box.uidHigh, box.uidLow);
-        for (const box of rfid) rfidValues.push(box.count);
-        await modbusHandler.writeHoldingRegisters(
-          sid,
-          HoldingRegisterAddresses.RFID_BOX_UID_START,
-          rfidValues
-        );
+        const vals = [];
+        rfid.forEach(b => vals.push(b.uidHigh, b.uidLow));
+        rfid.forEach(b => vals.push(b.count));
+        await modbusHandler.writeHoldingRegisters(sid, HoldingRegisterAddresses.RFID_BOX_UID_START, vals);
       }
-      if (volume != null) {
-        await modbusHandler.setSpeakerVolume(sid, volume);
-      }
+      if (volume != null) await modbusHandler.setSpeakerVolume(sid, volume);
     }
     res.json({ success: true });
   } catch (err) {
@@ -579,61 +560,42 @@ app.post('/api/configuration', async (req, res) => {
   }
 });
 
-// ── Configuration: soft reset all stations ────────────────────────────────────
+// Configuration: soft reset
 app.post('/api/configuration/soft-reset', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
     for (const sid of availableStations) {
-      if (!(await modbusHandler.softReset(sid))) {
-        throw new Error(`Failed to reset Station ${sid}`);
-      }
+      if (!(await modbusHandler.softReset(sid))) throw new Error(`Failed to reset Station ${sid}`);
     }
-
     await sleep(2000);
-
-    const timeout = 10000;
-    const start   = Date.now();
-    let allReset  = false;
-
-    while (!allReset && Date.now() - start < timeout) {
+    const start = Date.now();
+    let allReset = false;
+    while (!allReset && Date.now() - start < 10000) {
       allReset = true;
       for (const sid of availableStations) {
-        if (!(await modbusHandler.checkSoftResetComplete(sid))) {
-          allReset = false;
-          break;
-        }
+        if (!(await modbusHandler.checkSoftResetComplete(sid))) { allReset = false; break; }
       }
       if (!allReset) await sleep(200);
     }
-
-    if (!allReset) {
-      throw new Error('Reset timeout — check station status manually');
-    }
-
+    if (!allReset) throw new Error('Reset timeout');
     for (const sid of availableStations) {
       await modbusHandler.setActivePage(sid, PageID.PLACEMENT_PARAMETERS_SETUP);
     }
-
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Monitoring: all station status ────────────────────────────────────────────
+// Monitoring
 app.get('/api/monitoring', async (_req, res) => {
   if (!modbusHandler) return res.status(400).json({ error: 'Not connected' });
   try {
-    const allStations = [loaderStationId, ...pnpStations];
     const result = {};
-    for (const sid of allStations) {
+    for (const sid of [loaderStationId, ...pnpStations]) {
       const statusData   = await modbusHandler.getAllStatus(sid);
-      const inputCoils   = await modbusHandler.readCoils(
-        sid, CoilAddresses.INPUT_TRANSISTOR_1_IS_POPULATED, 14
-      );
-      const outputInputs = await modbusHandler.readDiscreteInputs(
-        sid, DiscreteInputAddresses.OUTPUT_TRANSISTOR_1_IS_POPULATED, 14
-      );
+      const inputCoils   = await modbusHandler.readCoils(sid, CoilAddresses.INPUT_TRANSISTOR_1_IS_POPULATED, 14);
+      const outputInputs = await modbusHandler.readDiscreteInputs(sid, DiscreteInputAddresses.OUTPUT_TRANSISTOR_1_IS_POPULATED, 14);
       result[sid] = { statusData, inputCoils, outputInputs };
     }
     res.json(result);
@@ -642,11 +604,10 @@ app.get('/api/monitoring', async (_req, res) => {
   }
 });
 
-// ─── START SERVER ─────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT ?? 3000;
 server.listen(PORT, () => {
-  console.log(
-    `[Server] SMT Pick & Place Controller running at http://localhost:${PORT}`
-  );
+  console.log(`[Server] SMT Pick & Place Controller running at http://localhost:${PORT}`);
+  startAutoDetect();
 });
